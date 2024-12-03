@@ -26,8 +26,11 @@ import data_utils.samplers as samplers
 from data_utils import build_dataset
 from engine import train_one_epoch, pose_evaluate, bop_evaluate
 from models import build_model
+from models.pose_estimation_transformer import MLP
 from evaluation_tools.pose_evaluator_init import build_pose_evaluator
 from inference_tools.inference_engine import inference
+from torchvision.models.detection.mask_rcnn import MultiScaleRoIAlign, MaskRCNNHeads, MaskRCNNPredictor
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 
 def get_args_parser():
@@ -168,6 +171,10 @@ def get_args_parser():
     parser.add_argument('--eval_bop', action='store_true', help="Run model in BOP challenge evaluation mode")
     parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
+    parser.add_argument('--transfer', action='store_true', default=False,
+                        help='Use transfer learning to fine tune the model for new classes')
+    parser.add_argument('--new_n_classes', default=21,type=int,
+                        help='The total number of classes in the new model when performing transfer learning')
 
     # * Distributed training parameters
     parser.add_argument('--distributed', action='store_true',
@@ -201,8 +208,7 @@ def main(args):
     model, criterion, matcher = build_model(args)
     model.to(device)
 
-
-    pose_evaluator = build_pose_evaluator(args)
+    #pose_evaluator = build_pose_evaluator(args)
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -243,8 +249,8 @@ def main(args):
                 break
         return out
 
-    for n, p in model_without_ddp.named_parameters():
-        print(n)
+    # for n, p in model_without_ddp.named_parameters():
+    #     print(n)
 
     param_dicts = [
         {
@@ -295,11 +301,12 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for pg, pg_old in zip(optimizer.param_groups, p_groups):
-                pg['lr'] = pg_old['lr']
-                pg['initial_lr'] = pg_old['initial_lr']
-            print(optimizer.param_groups)
+            if not args.transfer:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                for pg, pg_old in zip(optimizer.param_groups, p_groups):
+                    pg['lr'] = pg_old['lr']
+                    pg['initial_lr'] = pg_old['initial_lr']
+            # print(optimizer.param_groups)
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler
             #  (e.g., decrease lr in advance).
@@ -309,8 +316,63 @@ def main(args):
                     'Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
-            lr_scheduler.step(lr_scheduler.last_epoch)
+            if not args.transfer:
+                lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
+
+        if args.transfer:
+            for param in model_without_ddp.parameters():
+                param.requires_grad_(False)
+
+            hidden_dim = model_without_ddp.hidden_dim
+            t_dim = model_without_ddp.t_dim
+            rot_dim = model_without_ddp.rot_dim
+
+            if args.class_mode == 'agnostic':
+                for idx in range(len(model_without_ddp.translation_head)):
+                    model_without_ddp.rotation_head[idx] = MLP(hidden_dim, hidden_dim, 
+                                                          rot_dim, 3).to(device)
+                    model_without_ddp.translation_head[idx] = MLP(hidden_dim, hidden_dim, 
+                                                             t_dim, 3).to(device)
+                    
+            elif args.class_mode == 'specific':
+                for idx in range(len(model_without_ddp.translation_head)):
+                    model_without_ddp.rotation_head[idx] = MLP(hidden_dim, hidden_dim, 
+                                                          rot_dim * (args.new_n_classes + 1), 3).to(device)
+                    model_without_ddp.translation_head[idx] = MLP(hidden_dim, hidden_dim, 
+                                                             t_dim * (args.new_n_classes + 1), 3).to(device)
+                    
+            model_without_ddp.n_classes = args.new_n_classes + 1
+        
+            model_without_ddp.backbone[0].roi_heads.mask_predictor = MaskRCNNPredictor(256, 256, (args.new_n_classes + 1)).to(device)
+            model_without_ddp.backbone[0].roi_heads.box_predictor = FastRCNNPredictor(1024, args.new_n_classes + 1).to(device)
+
+            param_dicts = [
+                {
+                    "params":
+                        [p for n, p in model_without_ddp.named_parameters()
+                        if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n,
+                                                                                                   args.lr_linear_proj_names) and p.requires_grad],
+                    "lr": args.lr,
+                },
+                {
+                    "params": [p for n, p in model_without_ddp.named_parameters() if
+                            match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
+                    "lr": args.lr_backbone,
+                },
+                {
+                    "params": [p for n, p in model_without_ddp.named_parameters() if
+                            match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
+                    "lr": args.lr * args.lr_linear_proj_mult,
+                }
+            ]
+            if args.sgd:
+                optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
+                                            weight_decay=args.weight_decay)
+            else:
+                optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
+                                            weight_decay=args.weight_decay)
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     # Evaluate the models performance
     if args.eval:
@@ -319,8 +381,8 @@ def main(args):
         else:
             eval_epoch = None
 
-        pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
-                      args.rotation_representation, device, args.output_dir, eval_epoch)
+        # pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
+        #               args.rotation_representation, device, args.output_dir, eval_epoch)
         return
 
     # Evaluate the model for the BOP challenge
@@ -352,16 +414,31 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        # Do evaluation on the validation set every n epochs
-        if epoch % args.eval_interval == 0:
-            pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
-                          args.rotation_representation, device, args.output_dir, epoch)
+                mask_checkpoint = output_dir / ("mask_" + str(checkpoint_path)[len(str(output_dir)) + 1:])
 
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
-        else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                if args.backbone == 'maskrcnn':
+                    utils.save_on_master({
+                        'state_dict': model_without_ddp.backbone[0].state_dict(),
+                        'epoch': epoch,
+                        'args': args
+                    }, mask_checkpoint)
+                elif args.backbone == 'fasterrcnn':
+                    utils.save_on_master({
+                        'model': model_without_ddp.backbone[0].state_dict(),
+                        'epoch': epoch,
+                        'args': args
+                    }, mask_checkpoint)
+
+        # Do evaluation on the validation set every n epochs
+        # if epoch % args.eval_interval == 0:
+        #     pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
+        #                   args.rotation_representation, device, args.output_dir, epoch)
+
+        #     log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+        #                  'epoch': epoch,
+        #                  'n_parameters': n_parameters}
+        # else:
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
                          'n_parameters': n_parameters}
 
@@ -372,13 +449,13 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-    print('Evaluate final trained model')
-    eval_start_time = time.time()
-    pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
-                  args.rotation_representation, device, args.output_dir)
-    eval_total_time = time.time() - eval_start_time
-    eval_total_time_str = str(datetime.timedelta(seconds=int(eval_total_time)))
-    print('Evaluation time {}'.format(eval_total_time_str))
+    # print('Evaluate final trained model')
+    # eval_start_time = time.time()
+    # pose_evaluate(model, matcher, pose_evaluator, data_loader_val, args.eval_set, args.bbox_mode,
+    #               args.rotation_representation, device, args.output_dir)
+    # eval_total_time = time.time() - eval_start_time
+    # eval_total_time_str = str(datetime.timedelta(seconds=int(eval_total_time)))
+    # print('Evaluation time {}'.format(eval_total_time_str))
 
 
 if __name__ == '__main__':

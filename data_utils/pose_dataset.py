@@ -340,6 +340,6 @@ def build(image_set, args):
         jitter = False
     dataset = PoseDataset(img_folder, ann_file, synthetic_background=args.synt_background,
                           transforms=make_pose_estimation_transform(image_set, args.rgb_augmentation, args.grayscale),
-                          return_masks=False, jitter=jitter, jitter_probability=args.jitter_probability,
+                          return_masks=args.transfer, jitter=jitter, jitter_probability=args.jitter_probability,
                           cache_mode=args.cache_mode, local_rank=get_local_rank(), local_size=get_local_size())
     return dataset

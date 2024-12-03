@@ -29,15 +29,15 @@ class Joiner(nn.Sequential):
         self.strides = backbone.strides
         self.num_channels = backbone.num_channels
 
-    def forward(self, tensor_list: NestedTensor):
+    def forward(self, tensor_list: NestedTensor, targets=None):
         # TODO: Dirty, fix it
         # TODO: Currently the Object detector backbone has to be pretrained. Extend code to make object detectors
         #  trainable.
         if self[0].train_backbone:
-            raise NotImplementedError
+            predictions, xs, mask_loss = self[0](tensor_list, targets)
         else:
             self[0].eval()
-            predictions, xs = self[0](tensor_list)
+            predictions, xs, mask_loss = self[0](tensor_list)
         out: List[NestedTensor] = []
         pos = []
         for name, x in sorted(xs.items()):
@@ -47,7 +47,7 @@ class Joiner(nn.Sequential):
         for x in out:
             pos.append(self[1](x).to(x.tensors.dtype))
 
-        return out, pos, predictions
+        return out, pos, predictions, mask_loss
 
 
 def build_backbone(args):

@@ -176,7 +176,7 @@ class PoET(nn.Module):
 
         # Store the image size in HxW
         image_sizes = [[sample.shape[-2], sample.shape[-1]] for sample in samples.tensors]
-        features, pos, pred_objects = self.backbone(samples)
+        features, pos, pred_objects, _ = self.backbone(samples, targets)
 
         # Extract the bounding boxes for each batch element
         pred_boxes = []
