@@ -25,6 +25,7 @@ from typing import Iterable
 import numpy as np
 import torch
 import util.misc as utils
+from util.box_ops import box_cxcywh_to_xyxy, box_rescale_xyxy
 from util.quaternion_ops import quat2rot
 from data_utils.data_prefetcher import data_prefetcher
 
@@ -49,8 +50,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
+    mask_losses = []
+
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+
+        backbone_targets = targets.copy()
+        for sample, target in zip(samples.tensors, backbone_targets):
+            boxes = target['boxes']
+            boxes = box_cxcywh_to_xyxy(boxes)
+            boxes = box_rescale_xyxy(boxes, sample.shape[-2:])
+            target['boxes'] = boxes
+
+        backbone_feat, backbone_pos, backbone_pred, mask_loss = model.backbone(samples, targets)
+        losses = torch.stack([loss for loss in mask_loss.values()])
+        mask_losses.append(losses)
+        mask_loss = torch.sum(losses)
 
         outputs, n_boxes_per_sample = model(samples, targets)
         loss_dict = criterion(outputs, targets, n_boxes_per_sample)
@@ -74,6 +89,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         optimizer.zero_grad()
         losses.backward()
+        mask_loss.backward()
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
@@ -89,6 +105,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples, targets = prefetcher.next()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+    print("Mean mask loss: ", torch.mean(torch.stack(mask_losses)).item())
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 

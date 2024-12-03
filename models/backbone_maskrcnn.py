@@ -6,7 +6,7 @@
 
 import torch
 import torch.nn.functional as F
-from torchvision.models.detection.mask_rcnn import MaskRCNN
+from torchvision.models.detection.mask_rcnn import MaskRCNN, MultiScaleRoIAlign, MaskRCNNHeads, MaskRCNNPredictor
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.rpn import AnchorGenerator, concat_box_prediction_layers
 from typing import Dict, List
@@ -56,7 +56,7 @@ class MaskRCNNBackbone(MaskRCNN):
         if dataset == 'lmo':
             self.obj_id_map = {1: 1, 5: 2, 6: 3, 8: 4, 9: 5, 10: 6, 11: 7, 12: 8}
 
-    def forward(self, tensor_list: NestedTensor):
+    def forward(self, tensor_list: NestedTensor, targets=None):
         image_sizes = [img.shape[-2:] for img in tensor_list.tensors]
         # xs = self.backbone.body(tensor_list.tensors)
         features = self.backbone(tensor_list.tensors)
@@ -88,7 +88,7 @@ class MaskRCNNBackbone(MaskRCNN):
         proposals = self.rpn.box_coder.decode(pred_bbox_deltas.detach(), anchors)
         proposals = proposals.view(num_images, -1, 4)
         boxes, scores = self.rpn.filter_proposals(proposals, objectness, image_sizes, num_anchors_per_level)
-        detections, _ = self.roi_heads(features, boxes, image_sizes)
+        detections, loss = self.roi_heads(features, boxes, image_sizes, targets)
 
         # Translate the detections to predictions: [bbox, score, label]
         # TODO: optimize code
@@ -123,7 +123,7 @@ class MaskRCNNBackbone(MaskRCNN):
             assert m is not None
             mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
             out[name] = NestedTensor(x, mask)
-        return predictions, out
+        return predictions, out, loss
 
 
 def build_maskrcnn(args):
@@ -131,6 +131,8 @@ def build_maskrcnn(args):
     return_interm_layers = (args.num_feature_levels > 1)
     rcnn_cfg = yaml.load(Path(args.backbone_cfg).read_text(), Loader=yaml.FullLoader)
     n_classes = len(rcnn_cfg["label_to_category_id"])
+    if args.transfer:
+        n_classes = args.n_classes + 1
     backbone = MaskRCNNBackbone(input_resize=(rcnn_cfg["input_resize"][0], rcnn_cfg["input_resize"][1]),
                                 dataset=args.dataset,
                                 n_classes=n_classes,
@@ -147,5 +149,7 @@ def build_maskrcnn(args):
                 print("Loading Faster R-CNN weights")
                 print('Missing Keys: {}'.format(missing_keys))
                 print('PoET does not rely on the mask head of Mask R-CNN')
+    
+    backbone.train_backbone = args.transfer
     return backbone
 
